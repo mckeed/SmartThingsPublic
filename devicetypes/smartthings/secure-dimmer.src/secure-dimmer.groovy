@@ -19,6 +19,9 @@ metadata {
 		capability "Refresh"
 		capability "Sensor"
 
+		attribute "secure", "string"
+
+		fingerprint deviceId: "0x1101", inClusters: "0x98,0x86,0x72"
 		fingerprint deviceId: "0x11", inClusters: "0x98"
 	}
 
@@ -47,7 +50,7 @@ metadata {
 			state "turningOn", label:'${name}', action:"switch.off", icon:"st.switches.switch.on", backgroundColor:"#79b821", nextState:"turningOff"
 			state "turningOff", label:'${name}', action:"switch.on", icon:"st.switches.switch.off", backgroundColor:"#ffffff", nextState:"turningOn"
 		}
-		controlTile("levelSliderControl", "device.level", "slider", height: 1, width: 3, inactiveLabel: false) {
+		controlTile("levelSliderControl", "device.level", "slider", height: 2, width: 1, inactiveLabel: false) {
 			state "level", action:"switch level.setLevel"
 		}
 		standardTile("refresh", "device.switch", inactiveLabel: false, decoration: "flat") {
@@ -60,25 +63,24 @@ metadata {
 }
 
 def parse(String description) {
-	if (description.startsWith("Err 106")) {
-		state.sec = 0
-		createEvent(descriptionText: description, isStateChange: true)
+	def cmd = zwave.parse(description, [0x20: 1, 0x26: 3, 0x70: 1, 0x32:3])
+	if (cmd) {
+		zwaveEvent(cmd)
 	} else {
-		def cmd = zwave.parse(description, [0x20: 1, 0x26: 3, 0x70: 1, 0x32:3, 0x98: 1])
-		if (cmd) {
-			zwaveEvent(cmd)
-		} else {
-			log.debug("Couldn't zwave.parse '$description'")
-			null
-		}
+		log.debug("Couldn't zwave.parse '$description'")
+		null
 	}
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.securityv1.SecurityMessageEncapsulation cmd) {
 	def encapsulatedCommand = cmd.encapsulatedCommand([0x20: 1, 0x26: 3, 0x32: 3])
-	state.sec = 1
-	if (encapsulatedCommand) {
-		zwaveEvent(encapsulatedCommand)
+	zwaveEvent = zwaveEvent(encapsulatedCommand)
+
+	if (device.currentValue("secure") != "yes") {
+		setSecure = [name: "secure", value: "yes", descriptionText: "$device.name is secure", displayed: false]
+		[zwaveEvent, setSecure]
+	} else {
+		zwaveEvent
 	}
 }
 
@@ -94,34 +96,53 @@ def zwaveEvent(physicalgraph.zwave.commands.switchmultilevelv3.SwitchMultilevelR
 	dimmerEvents(cmd)
 }
 
-private dimmerEvents(physicalgraph.zwave.Command cmd) {
-	def value = (cmd.value ? "on" : "off")
-	def result = [createEvent(name: "switch", value: value, descriptionText: "$device.displayName was turned $value")]
-	if (cmd.value) {
-		result << createEvent(name: "level", value: cmd.value, unit: "%")
+def dimmerEvents(physicalgraph.zwave.Command cmd) {
+	def switchEvent = [name: "switch"]
+	switchEvent.linkText = getLinkText(device)
+	switchEvent.value = cmd.value ? "on" : "off"
+	switchEvent.handlerName = cmd.value ? "statusOn" : "statusOff"
+	switchEvent.descriptionText = "${switchEvent.linkText} is ${switchEvent.value}"
+	switchEvent.canBeCurrentState = true
+	switchEvent.isStateChange = isStateChange("switch", switchEvent.value)
+
+	def levelEvent = [name: "level"]
+	levelEvent.linkText = switchEvent.linkText
+	levelEvent.value = cmd.value as String
+	levelEvent.unit = "%"
+	levelEvent.descriptionText = "${switchEvent.linkText} set to ${levelEvent.value}%"
+	levelEvent.canBeCurrentState = true
+	levelEvent.isStateChange = isStateChange("level", levelEvent.value)
+
+	if (cmd.value == 0 || cmd.value >= 99) {
+		// All the way off or on, don't show level event
+		switchEvent.displayed = switchEvent.isStateChange
+		levelEvent.displayed = !switchEvent.displayed
+	} else {
+		// Turned on to a specific percentage, show level event
+		switchEvent.displayed = false
+		levelEvent.displayed = levelEvent.isStateChange
 	}
-	return result
+	[switchEvent, levelEvent]
 }
 
 def zwaveEvent(physicalgraph.zwave.commands.meterv3.MeterReport cmd) {
-	def map = [:]
 	if (cmd.meterType == 1) {
 		if (cmd.scale == 0) {
-			map = [name: "energy", value: cmd.scaledMeterValue, unit: "kWh"]
+			createEvent(name: "energy", value: cmd.scaledMeterValue, unit: "kWh")
 		} else if (cmd.scale == 1) {
-			map = [name: "energy", value: cmd.scaledMeterValue, unit: "kVAh"]
+			createEvent(name: "energy", value: cmd.scaledMeterValue, unit: "kVAh")
 		} else if (cmd.scale == 2) {
-			map = [name: "power", value: cmd.scaledMeterValue, unit: "W"]
+			createEvent(name: "power", value: cmd.scaledMeterValue, unit: "W")
 		} else {
-			map = [name: "electric", value: cmd.scaledMeterValue, unit: ["pulses", "V", "A", "R/Z", ""][cmd.scale - 3]]
+			createEvent(name: "electric", value: cmd.scaledMeterValue, unit: ["pulses", "V", "A", "R/Z", ""][cmd.scale - 3])
 		}
 	} else if (cmd.meterType == 2) {
-		map = [name: "gas", value: cmd.scaledMeterValue, unit: ["m^3", "ft^3", "", "pulses", ""][cmd.scale]]
+		createEvent(name: "gas", value: cmd.scaledMeterValue, unit: ["m^3", "ft^3", "", "pulses", ""][cmd.scale])
 	} else if (cmd.meterType == 3) {
-		map = [name: "water", value: cmd.scaledMeterValue, unit: ["m^3", "ft^3", "gal"][cmd.scale]]
+		createEvent(name: "water", value: cmd.scaledMeterValue, unit: ["m^3", "ft^3", "gal"][cmd.scale])
+	} else {
+		null
 	}
-	map.isStateChange = true  // just show in activity
-	createEvent(map)
 }
 
 def zwaveEvent(physicalgraph.zwave.Command cmd) {
@@ -133,14 +154,14 @@ def on() {
 	secureSequence([
 		zwave.basicV1.basicSet(value: 0xFF),
 		zwave.switchMultilevelV1.switchMultilevelGet()
-	], 3500)
+	])
 }
 
 def off() {
 	secureSequence([
 		zwave.basicV1.basicSet(value: 0x00),
 		zwave.switchMultilevelV1.switchMultilevelGet()
-	], 3500)
+	])
 }
 
 def setLevel(value) {
@@ -159,14 +180,14 @@ def refresh() {
 	secure(zwave.switchMultilevelV1.switchMultilevelGet())
 }
 
-private secure(physicalgraph.zwave.Command cmd) {
-	if (state.sec) {
+def secure(physicalgraph.zwave.Command cmd) {
+	if (device.currentValue("secure") == "yes") {
 		zwave.securityV1.securityMessageEncapsulation().encapsulate(cmd).format()
 	} else {
 		cmd.format()
 	}
 }
 
-private secureSequence(Collection commands, ...delayBetweenArgs) {
+def secureSequence(Collection commands, ...delayBetweenArgs) {
 	delayBetween(commands.collect{ secure(it) }, *delayBetweenArgs)
 }
